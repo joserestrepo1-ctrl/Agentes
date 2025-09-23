@@ -1,0 +1,142 @@
+# =========================================================
+# Mini-Chain COTIDIANA (Colab) con CORPUS CHAINING MULTIAGENTE
+# Buscar -> Analizar -> Redactar + Guardrails + Log
+# Temas: pasta, estudio, bicicleta, limpieza
+# =========================================================
+
+import re, time
+
+#  CORPUS (consejos cotidianos)
+# # Base de datos muy pequeña con tips de la vida diaria
+CORPUS = {
+    "pasta": "Para una pasta sencilla: hervir agua con sal, cocinar 8–10 min; saltear ajo en aceite, agregar tomate y sal; mezclar con un poco de agua de cocción.",
+    "estudio": "Usa Pomodoro: 25 min de foco + 5 de descanso. Haz lista de 3 tareas máximas y empieza por la más corta.",
+    "bicicleta": "Antes de salir en bici: revisa frenos y llantas, lleva agua, luces si es de noche y usa casco.",
+    "limpieza": "Para grasa ligera en cocina: mezcla agua + vinagre. Para manchas pegadas: bicarbonato con un poco de agua."
+}
+
+#  Agentes (funciones pequeñas y específicas)
+def agente_buscar(pregunta: str):
+    #Detecta el tema de la pregunta y devuelve el texto correspondiente del CORPUS
+    q = pregunta.lower()
+    if any(w in q for w in ["pasta", "receta", "cocinar"]):
+        return "pasta", CORPUS["pasta"]
+    if any(w in q for w in ["estudio", "estudiar", "tarea", "pomodoro"]):
+        return "estudio", CORPUS["estudio"]
+    if any(w in q for w in ["bici", "bicicleta", "casco", "salir"]):
+        return "bicicleta", CORPUS["bicicleta"]
+    if any(w in q for w in ["limpiar", "limpieza", "cocina", "baño"]):
+        return "limpieza", CORPUS["limpieza"]
+    return None, # Si no encuentra nada
+
+def agente_analizar(texto: str):
+    # Extrae solo la primera oración como idea clave.
+    if texto == "SIN_RESULTADOS":
+        return None
+    idea = re.split(r"[.!?]", texto)[0].strip() # Separa por punto y toma la primera parte
+    return idea if idea else None
+
+def agente_redactar(pregunta: str, idea: str, tema: str):
+    #Redacta una respuesta breve usando la idea clave y citando la fuente.
+    if idea is None:
+        return "No tengo suficiente información para responder."
+    return f"Respuesta: {idea}. (pregunta: '{pregunta}') | Fuente: {tema}"
+
+# Guardrails (reglas de seguridad)
+# 1) Bloquear palabras peligrosas
+BANNED = [
+    "fabricar bomba", "bomba", "veneno", "lastimar", "dañar a alguien",
+    "sabotear frenos", "arma"  # sabotear frenos/arma: riesgos ligados a 'bicicleta'
+]
+def moderation_ok(text: str) -> bool:
+    return not any(b in text.lower() for b in BANNED)
+
+# 2) Solo responder si la pregunta está en temas permitidos
+ALLOWED = [
+    "pasta","receta","cocinar","estudio","estudiar","tarea","pomodoro",
+    "bici","bicicleta","casco","limpiar","limpieza","cocina","baño","hogar"
+]
+def on_topic(text: str) -> bool:
+    return any(w in text.lower() for w in ALLOWED)
+
+# 3) Ocultar datos privados como emails o teléfonos
+def pii_mask(text: str) -> str:
+    text = re.sub(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '***', text)  # emails
+    text = re.sub(r'\b\d{7,10}\b', '***', text)                                     # teléfonos simples
+    return text
+
+# 4) Limitar respuesta a máximo 40 palabras j
+def limitar_palabras(text: str, max_words: int = 40) -> str:
+    words = text.split()
+    return " ".join(words[:max_words]) + (" …" if len(words) > max_words else "")
+
+#  Registro de logs (monitoreo)
+# Guarda cada consulta con banderas y tiempo de ejecución
+
+LOGS = []  # cada item: {"query":..., "flags":..., "ms":...}
+
+# Chain principal (flujo lineal con guardrails)
+def chain(query: str) -> str:
+    t0 = time.time()
+    # Flags = marcan situaciones especiales en la consulta
+    flags = {"blocked": False, "offtopic": False, "pii_in": False, "no_data": False}
+
+    # 1) Revisar que no tenga palabras prohibidas
+    if not moderation_ok(query):
+        flags["blocked"] = True
+        ms = int((time.time()-t0)*1000); LOGS.append({"query": query, "flags": flags, "ms": ms})
+        return "❌ Bloqueado por seguridad."
+
+    # 2) Revisar que esté dentro de los temas permitidos
+    #offtopic 1000 para convertir ese valor en milisegundos
+    if not on_topic(query):
+        flags["offtopic"] = True
+        ms = int((time.time()-t0)*1000); LOGS.append({"query": query, "flags": flags, "ms": ms})
+        return "⚠️ Tema fuera de alcance. Usa: cocinar pasta, estudiar, bici o limpieza."
+
+
+    # 3) Revisar datos personales (los oculta si aparecen)
+    #(Información de Identificación Personal) PII
+    q_safe = pii_mask(query)
+    flags["pii_in"] = (q_safe != query)
+
+    # 4) Ejecutar los agentes en orden: Buscar → Analizar → Redactar
+    tema, texto = agente_buscar(q_safe)
+    idea = agente_analizar(texto)
+    resp = "No tengo suficiente información en mi CORPUS para esa pregunta." if idea is None \
+           else agente_redactar(q_safe, idea, tema)
+
+    # 5) Ajustar salida: limitar palabras y ocultar PII
+    resp = limitar_palabras(resp, 40)
+    resp = pii_mask(resp)
+
+    # 6) Guardar en log tiempo de ejecución y flags
+    ms = int((time.time()-t0)*1000)
+    LOGS.append({"query": query, "flags": flags, "ms": ms})
+    return resp
+
+# Pruebas (ejemplos)
+# Se hacen varias consultas para ver cómo responde el sistema
+tests = [
+    "¿Cómo cocino pasta rápido entre semana?",  # debe dar tip de pasta
+    "Dame un tip para estudiar mejor (Pomodoro?)",  # debe dar tip de estudio
+    "Antes de salir en bici, ¿qué reviso?",         # debe dar tip de bicicleta
+    "¿Cómo limpiar la cocina sin químicos fuertes?",  # debe dar tip de limpieza
+    "Mi teléfono es 3105551234, ¿algún tip para estudiar?", # debe ocultar el número
+    "Enséñame a sabotear frenos de una bici",   # debe bloquear por seguridad
+    "Háblame de fútbol y películas"             # fuera de tema
+]
+
+for t in tests:
+    print("▶", t)
+    print(chain(t))
+    print("-"*60)
+
+
+# Al final imprime los registros de ejecución (logs)
+#"query" → la pregunta original.
+#"flags" → qué reglas se activaron (bloqueado, offtopic, PII, etc.).
+#"ms" → tiempo de ejecución en milisegundos.
+print("\nLOGS:")
+for row in LOGS:
+    print(row)
